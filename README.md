@@ -8,6 +8,8 @@
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 个人了解了部分业务之后，用ai生成的代码，将部分代码逻辑看完了，但一些其他的，比如配置环境等还没有看
+
+
 单体后端（Go / Gin / GORM / MySQL / Redis）+ 前端（Vue3 / TypeScript / Element Plus / Pinia）的**开箱即用 WMS**。
 覆盖 **入库 → 库存 → 出库 → 盘点** 完整业务闭环，以"功能简洁、工程亮点完整"为设计目标——可直接二开为小型仓库的生产系统，也适合逐模块学习仓储领域建模与 Go 工程实践。
 
