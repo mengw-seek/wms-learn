@@ -1,0 +1,37 @@
+package lock
+
+import (
+	"context"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	"github.com/google/uuid"
+)
+
+// Locker Redis 分布式锁：SET NX EX 加锁 + Lua 校验持有者后释放（防止误删他人的锁）。
+type Locker struct {
+	rdb *redis.Client
+}
+
+func New(rdb *redis.Client) *Locker { return &Locker{rdb: rdb} }
+
+var unlockScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+`)
+
+// Lock 获取锁；成功返回 release 函数，失败返回 ok=false。
+func (l *Locker) Lock(ctx context.Context, key string, ttl time.Duration) (release func(), ok bool, err error) {
+	token := uuid.NewString()
+	ok, err = l.rdb.SetNX(ctx, key, token, ttl).Result()
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	release = func() {
+		_ = unlockScript.Run(context.Background(), l.rdb, []string{key}, token).Err()
+	}
+	return release, true, nil
+}

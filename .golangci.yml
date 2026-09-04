@@ -1,0 +1,28 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck      # 未检查的错误返回
+    - govet         # 官方 vet 检查
+    - staticcheck   # 静态分析（含 dead code 常见模式）
+    - unused        # 未使用的代码
+    - ineffassign   # 无效赋值
+    - misspell      # 拼写错误
+  settings:
+    staticcheck:
+      checks: ["all"]
+
+formatters:
+  enable:
+    - gofmt
+
+issues:
+  exclude-rules:
+    # 测试文件中允许忽略返回值（如构造测试数据）
+    - path: _test\.go
+      linters:
+        - errcheck

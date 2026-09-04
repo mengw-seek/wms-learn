@@ -1,0 +1,106 @@
+package handler
+
+import (
+	"strconv"
+
+	"github.com/gin-gonic/gin"
+
+	"gowms/internal/modules/stocktake/dto"
+	"gowms/internal/modules/stocktake/service"
+	"gowms/internal/pkg/errcode"
+	"gowms/internal/pkg/middleware"
+	"gowms/internal/pkg/response"
+)
+
+type Handler struct {
+	svc *service.Service
+}
+
+func New(svc *service.Service) *Handler { return &Handler{svc: svc} }
+
+func (h *Handler) RegisterRoutes(auth *gin.RouterGroup, checker middleware.PermsChecker) {
+	g := auth.Group("/stocktake")
+	perm := func(action string) gin.HandlerFunc {
+		return middleware.Permission(checker, "wms:stocktake:"+action)
+	}
+
+	orders := g.Group("/orders")
+	{
+		orders.GET("", h.list)
+		orders.GET("/:id", h.get)
+		orders.POST("", perm("create"), h.create)
+		orders.POST("/:id/actual", perm("stocktake"), h.recordActual)
+		orders.POST("/:id/approve", perm("approve"), h.approve)
+		orders.POST("/:id/cancel", perm("cancel"), h.cancel)
+	}
+}
+
+func (h *Handler) list(c *gin.Context) {
+	var q dto.OrderQuery
+	if err := c.ShouldBindQuery(&q); err != nil {
+		response.Fail(c, errcode.ParamError)
+		return
+	}
+	list, total, err := h.svc.List(c.Request.Context(), &q)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OKPage(c, list, total)
+}
+
+func (h *Handler) get(c *gin.Context) {
+	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	detail, err := h.svc.Get(c.Request.Context(), id)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, detail)
+}
+
+func (h *Handler) create(c *gin.Context) {
+	var req dto.CreateOrderReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, errcode.ParamError)
+		return
+	}
+	order, err := h.svc.Create(c.Request.Context(), &req, middleware.Username(c))
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, order)
+}
+
+func (h *Handler) recordActual(c *gin.Context) {
+	var req dto.RecordActualReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.Fail(c, errcode.ParamError)
+		return
+	}
+	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err := h.svc.RecordActual(c.Request.Context(), id, req.DetailID, req.ActualQty); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, nil)
+}
+
+func (h *Handler) approve(c *gin.Context) {
+	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err := h.svc.Approve(c.Request.Context(), id, middleware.Username(c)); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, nil)
+}
+
+func (h *Handler) cancel(c *gin.Context) {
+	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err := h.svc.Cancel(c.Request.Context(), id); err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, nil)
+}

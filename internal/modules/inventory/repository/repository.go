@@ -1,0 +1,193 @@
+package repository
+
+import (
+	"context"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"gowms/internal/modules/inventory/model"
+)
+
+type Repository struct{}
+
+func New() *Repository { return &Repository{} }
+
+// FindFIFOForUpdate 悲观行锁 + FIFO：锁定指定仓库/SKU 下所有可分配库存行，并联查库位编码。
+// 防超卖第一层：FOR UPDATE 行锁串行化同一库存行的并发分配。
+func (r *Repository) FindFIFOForUpdate(tx *gorm.DB, warehouseID, skuID int64) ([]*model.Inventory, error) {
+	var list []*model.Inventory
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Table("wms_inventory i").
+		Select("i.*, l.code AS location_code").
+		Joins("JOIN wms_location l ON l.id = i.location_id").
+		Where("i.warehouse_id = ? AND i.sku_id = ? AND i.available_quantity > 0", warehouseID, skuID).
+		Order("i.stock_in_time ASC, i.id ASC").
+		Scan(&list).Error
+	return list, err
+}
+
+// GetForUpdate 按主键锁定库存行。
+func (r *Repository) GetForUpdate(tx *gorm.DB, id int64) (*model.Inventory, error) {
+	var inv model.Inventory
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&inv, id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &inv, nil
+}
+
+// GetByTuple 按四元组查询（仓库+库位+SKU+批次）。
+func (r *Repository) GetByTuple(tx *gorm.DB, warehouseID, locationID, skuID int64, batchNo string) (*model.Inventory, error) {
+	var inv model.Inventory
+	err := tx.Where("warehouse_id = ? AND location_id = ? AND sku_id = ? AND batch_no = ?",
+		warehouseID, locationID, skuID, batchNo).First(&inv).Error
+	if err != nil {
+		return nil, err
+	}
+	return &inv, nil
+}
+
+func (r *Repository) Create(tx *gorm.DB, inv *model.Inventory) error {
+	return tx.Create(inv).Error
+}
+
+// IncreaseQty 累加库存（行已锁定，直接更新）。
+func (r *Repository) IncreaseQty(tx *gorm.DB, id int64, stock, available int) error {
+	return tx.Exec("UPDATE wms_inventory SET stock_quantity = stock_quantity + ?, available_quantity = available_quantity + ? WHERE id = ?",
+		stock, available, id).Error
+}
+
+// AllocateQty 防超卖第二层：WHERE 条件防护，affected rows = 0 判定并发冲突。
+// UPDATE ... SET available = available - ?, allocated = allocated + ? WHERE id = ? AND available >= ?
+func (r *Repository) AllocateQty(tx *gorm.DB, id int64, qty int) (int64, error) {
+	res := tx.Exec(
+		"UPDATE wms_inventory SET available_quantity = available_quantity - ?, allocated_quantity = allocated_quantity + ?, version = version + 1 WHERE id = ? AND available_quantity >= ?",
+		qty, qty, id, qty)
+	return res.RowsAffected, res.Error
+}
+
+// ShipQty 发货扣减：WHERE stock >= ? AND allocated >= ? 双条件防负。
+func (r *Repository) ShipQty(tx *gorm.DB, id int64, qty int) (int64, error) {
+	res := tx.Exec(
+		"UPDATE wms_inventory SET stock_quantity = stock_quantity - ?, allocated_quantity = allocated_quantity - ?, version = version + 1 WHERE id = ? AND stock_quantity >= ? AND allocated_quantity >= ?",
+		qty, qty, id, qty, qty)
+	return res.RowsAffected, res.Error
+}
+
+// ReleaseQty 取消分配：WHERE allocated >= ?。
+func (r *Repository) ReleaseQty(tx *gorm.DB, id int64, qty int) (int64, error) {
+	res := tx.Exec(
+		"UPDATE wms_inventory SET available_quantity = available_quantity + ?, allocated_quantity = allocated_quantity - ?, version = version + 1 WHERE id = ? AND allocated_quantity >= ?",
+		qty, qty, id, qty)
+	return res.RowsAffected, res.Error
+}
+
+// AdjustNegative 盘点调减：调减量不允许吃掉已分配库存，要求 available >= 减量。
+func (r *Repository) AdjustNegative(tx *gorm.DB, id int64, qty int) (int64, error) {
+	res := tx.Exec(
+		"UPDATE wms_inventory SET stock_quantity = stock_quantity - ?, available_quantity = available_quantity - ?, version = version + 1 WHERE id = ? AND available_quantity >= ?",
+		qty, qty, id, qty)
+	return res.RowsAffected, res.Error
+}
+
+// AdjustPositive 盘点调增（行已锁定）。
+func (r *Repository) AdjustPositive(tx *gorm.DB, id int64, qty int) error {
+	return tx.Exec(
+		"UPDATE wms_inventory SET stock_quantity = stock_quantity + ?, available_quantity = available_quantity + ?, version = version + 1 WHERE id = ?",
+		qty, qty, id).Error
+}
+
+// InsertTrans 同事务写流水（只增不改）。
+func (r *Repository) InsertTrans(tx *gorm.DB, trans *model.InventoryTrans) error {
+	return tx.Create(trans).Error
+}
+
+// ---------- 查询（Handler 用，非事务） ----------
+
+type QueryFilter struct {
+	WarehouseID int64
+	LocationID  int64
+	SKUID       int64
+	SKUKeyword  string
+	Page, Size  int
+}
+
+func (r *Repository) List(ctx context.Context, db *gorm.DB, f *QueryFilter) ([]*model.Inventory, int64, error) {
+	q := db.WithContext(ctx).Model(&model.Inventory{})
+	if f.WarehouseID > 0 {
+		q = q.Where("warehouse_id = ?", f.WarehouseID)
+	}
+	if f.LocationID > 0 {
+		q = q.Where("location_id = ?", f.LocationID)
+	}
+	if f.SKUID > 0 {
+		q = q.Where("sku_id = ?", f.SKUID)
+	}
+	if f.SKUKeyword != "" {
+		q = q.Where("sku_id IN (SELECT id FROM wms_sku WHERE deleted_at IS NULL AND (code LIKE ? OR name LIKE ? OR barcode LIKE ?))",
+			"%"+f.SKUKeyword+"%", "%"+f.SKUKeyword+"%", "%"+f.SKUKeyword+"%")
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []*model.Inventory
+	err := q.Order("id DESC").Offset((f.Page - 1) * f.Size).Limit(f.Size).Find(&list).Error
+	return list, total, err
+}
+
+// SummaryBySKU 按 SKU 汇总视图。
+func (r *Repository) SummaryBySKU(ctx context.Context, db *gorm.DB, warehouseID int64, page, size int) ([]map[string]any, int64, error) {
+	q := db.WithContext(ctx).Table("wms_inventory i").
+		Joins("JOIN wms_sku s ON s.id = i.sku_id AND s.deleted_at IS NULL").
+		Where("i.deleted_at IS NULL")
+	if warehouseID > 0 {
+		q = q.Where("i.warehouse_id = ?", warehouseID)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []map[string]any
+	err := q.Select("i.sku_id, s.code AS sku_code, s.name AS sku_name, s.unit, " +
+		"SUM(i.stock_quantity) AS stock_quantity, SUM(i.available_quantity) AS available_quantity, " +
+		"SUM(i.allocated_quantity) AS allocated_quantity").
+		Group("i.sku_id, s.code, s.name, s.unit").
+		Order("i.sku_id").
+		Offset((page - 1) * size).Limit(size).Scan(&list).Error
+	return list, total, err
+}
+
+func (r *Repository) ListTrans(ctx context.Context, db *gorm.DB, inventoryID int64, orderNo, transType string, page, size int) ([]*model.InventoryTrans, int64, error) {
+	q := db.WithContext(ctx).Model(&model.InventoryTrans{})
+	if inventoryID > 0 {
+		q = q.Where("inventory_id = ?", inventoryID)
+	}
+	if orderNo != "" {
+		q = q.Where("order_no LIKE ?", "%"+orderNo+"%")
+	}
+	if transType != "" {
+		q = q.Where("trans_type = ?", transType)
+	}
+	var total int64
+	if err := q.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []*model.InventoryTrans
+	err := q.Order("id DESC").Offset((page - 1) * size).Limit(size).Find(&list).Error
+	return list, total, err
+}
+
+// HasStockByWarehouse / HasStockByLocation 删除校验。
+func (r *Repository) HasStockByWarehouse(ctx context.Context, db *gorm.DB, warehouseID int64) (bool, error) {
+	var n int64
+	err := db.WithContext(ctx).Model(&model.Inventory{}).Where("warehouse_id = ? AND stock_quantity > 0", warehouseID).Count(&n).Error
+	return n > 0, err
+}
+
+func (r *Repository) HasStockByLocation(ctx context.Context, db *gorm.DB, locationID int64) (bool, error) {
+	var n int64
+	err := db.WithContext(ctx).Model(&model.Inventory{}).Where("location_id = ? AND stock_quantity > 0", locationID).Count(&n).Error
+	return n > 0, err
+}

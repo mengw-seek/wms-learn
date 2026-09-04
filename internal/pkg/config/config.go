@@ -1,0 +1,76 @@
+package config
+
+import (
+	"strings"
+
+	"github.com/spf13/viper"
+)
+
+type Config struct {
+	Server ServerConfig `mapstructure:"server"`
+	MySQL  MySQLConfig  `mapstructure:"mysql"`
+	Redis  RedisConfig  `mapstructure:"redis"`
+	JWT    JWTConfig    `mapstructure:"jwt"`
+	Log    LogConfig    `mapstructure:"log"`
+	Upload UploadConfig `mapstructure:"upload"`
+}
+
+type ServerConfig struct {
+	Port int    `mapstructure:"port"`
+	Mode string `mapstructure:"mode"` // debug / release
+}
+
+type MySQLConfig struct {
+	DSN          string `mapstructure:"dsn"`
+	MaxOpenConns int    `mapstructure:"max_open_conns"`
+	MaxIdleConns int    `mapstructure:"max_idle_conns"`
+}
+
+type RedisConfig struct {
+	Addr     string `mapstructure:"addr"`
+	Password string `mapstructure:"password"`
+	DB       int    `mapstructure:"db"`
+}
+
+type JWTConfig struct {
+	Secret      string `mapstructure:"secret"`
+	ExpireHours int    `mapstructure:"expire_hours"`
+}
+
+type LogConfig struct {
+	Level string `mapstructure:"level"` // debug / info / warn / error
+}
+
+type UploadConfig struct {
+	Dir string `mapstructure:"dir"`
+}
+
+// Load 读取 configs/config.yaml；支持环境变量覆盖（WMS_ 前缀，. 分隔，如 WMS_MYSQL_DSN）。
+func Load(path string) (*Config, error) {
+	v := viper.New()
+	v.SetConfigFile(path)
+	v.SetEnvPrefix("WMS")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	if err := v.ReadInConfig(); err != nil {
+		return nil, err
+	}
+	var cfg Config
+	if err := v.Unmarshal(&cfg); err != nil {
+		return nil, err
+	}
+	if cfg.MySQL.MaxOpenConns <= 0 {
+		cfg.MySQL.MaxOpenConns = 50
+	}
+	if cfg.MySQL.MaxIdleConns <= 0 {
+		cfg.MySQL.MaxIdleConns = 10
+	}
+	if cfg.JWT.ExpireHours <= 0 {
+		cfg.JWT.ExpireHours = 24
+	}
+	if cfg.Upload.Dir == "" {
+		cfg.Upload.Dir = "./data/uploads"
+	}
+	return &cfg, nil
+}

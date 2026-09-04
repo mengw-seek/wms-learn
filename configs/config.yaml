@@ -1,0 +1,23 @@
+server:
+  port: 8080
+  mode: debug          # debug / release
+
+mysql:
+  dsn: "root:1234@tcp(127.0.0.1:3306)/gowms?charset=utf8mb4&parseTime=True&loc=Local"
+  max_open_conns: 50
+  max_idle_conns: 10
+
+redis:
+  addr: 127.0.0.1:6379
+  password: ""
+  db: 0
+
+jwt:
+  secret: "gowms-dev-secret-change-me-in-prod"
+  expire_hours: 24
+
+log:
+  level: info          # debug / info / warn / error
+
+upload:
+  dir: ./data/uploads

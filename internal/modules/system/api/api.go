@@ -1,0 +1,11 @@
+package api
+
+import (
+	"gowms/internal/pkg/middleware"
+)
+
+// SystemAPI system 模块对外暴露的接口（供中间件与 app 组装使用）。
+type SystemAPI interface {
+	middleware.PermsChecker    // HasPerm：权限校验
+	middleware.OperLogRecorder // Record：操作日志异步落库
+}

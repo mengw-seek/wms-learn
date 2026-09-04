@@ -1,0 +1,8 @@
+bin/
+data/
+*.exe
+.idea/
+.vscode/
+node_modules/
+dist/
+.env
