@@ -89,15 +89,6 @@ wms/
 
 > 完整状态机图与角色权限矩阵见 [需求规格说明书](docs/requirements.md)。
 
-## 源码学习路线（建议顺序）
-
-1. **跑通业务**：按上面的顺序在前端走完入库/出库闭环，对流程建立直觉；
-2. **库存核心**：[inventory/service](internal/modules/inventory/service/service.go) → [repository](internal/modules/inventory/repository/repository.go)，看懂三数量与双重防超卖；
-3. **跑测试**：`make test`，读 [service_test.go](internal/modules/inventory/service/service_test.go) 理解并发测试怎么写；
-4. **出库编排**：[outbound/service](internal/modules/outbound/service/service.go)，看"审核即分配"如何在一个事务内跨模块协作；
-5. **工程机制**：`internal/pkg/tx`（事务边界）、`orderno`（单号降级）、`middleware`（JWT/权限/审计）；
-6. **可靠性样本**：[inbound/service](internal/modules/inbound/service/service.go) 的 Excel 异步导入（状态机/CAS/补偿）；
-7. **前端**：`web/src/api`（类型化请求层）→ `stores`（Pinia）→ 任一业务页面 → `style.css`（双主题令牌）。
 
 ## 测试
 
