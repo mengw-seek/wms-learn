@@ -27,14 +27,6 @@
 | 统一任务表 `wms_task`（收货/上架/拣货共用） | `internal/modules/task` |
 | JWT 认证 + 路由级权限串 + 异步操作日志审计 | `internal/modules/system`、`pkg/middleware` |
 
-## 文档导航（docs/）
-
-| 文档 | 内容 |
-| --- | --- |
-| [需求规格说明书](docs/requirements.md) | 背景/目标、角色权限、7 大模块功能需求、业务流程状态机、非功能需求 |
-| [系统架构设计](docs/architecture.md) | 模块化单体架构、分层与依赖规则、核心设计详解（防超卖/FIFO/状态机/单号/异步导入）、关键时序图、演进路线 |
-| [数据库设计](docs/database.md) | 18 张表总览、ER 图、核心表详解、索引与约束设计意图 |
-| [API 接口文档](docs/api.md) | 全部 30+ 端点、统一响应/认证/分页约定、请求示例 |
 
 ## 快速开始
 
