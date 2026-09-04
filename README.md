@@ -7,7 +7,7 @@
 ![Redis](https://img.shields.io/badge/Redis-可选·自动降级-DC382D?logo=redis&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-学生时期练手项目，本来是学的java，了解了业务之后，做了一个wms系统。但又想转go了，于是用ai重构了项目
+学生时期练手项目，本来是学的java，了解了业务之后，用ruoyi做了一个简单的wms系统。但又想转go了，于是用ai重构了项目
 大体代码逻辑看完了，但一些其他的，比如配置环境等还没有看，对go还是有一些生疏
 
 
