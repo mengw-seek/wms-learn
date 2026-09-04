@@ -131,6 +131,3 @@ go test ./internal/modules/inventory/service/ -v
 
 `configs/config.yaml`：MySQL DSN、Redis、JWT secret（**生产环境必须更换**）、上传目录、日志级别。
 
-## License
-
-[MIT](LICENSE)
