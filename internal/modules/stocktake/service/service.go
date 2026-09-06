@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sort"
 
 	"gorm.io/gorm"
 
@@ -87,6 +88,9 @@ func (s *Service) Approve(ctx context.Context, orderID int64, operator string) e
 		if err != nil {
 			return err
 		}
+		// 按库存行 ID 排序后再调整：统一加锁顺序，
+		// 避免与出库审核等并发事务交叉加锁导致死锁
+		sort.Slice(details, func(i, j int) bool { return details[i].InventoryID < details[j].InventoryID })
 		anyCounted := false
 		for _, d := range details {
 			if d.ActualQty == nil || d.Adjusted {

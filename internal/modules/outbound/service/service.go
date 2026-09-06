@@ -113,6 +113,9 @@ func (s *Service) Approve(ctx context.Context, id int64, operator string) error 
 		if err != nil {
 			return err
 		}
+		// 按 SKU_ID 排序后再分配：所有事务库存行加锁顺序全局一致，
+		// 避免并发审核交叉加锁（T1 持 A 等 B，T2 持 B 等 A）导致死锁
+		sort.Slice(details, func(i, j int) bool { return details[i].SKUID < details[j].SKUID })
 
 		// 逐明细 FIFO 分配（失败即整体回滚）
 		allocations := make([]*model.Allocation, 0, len(details))
