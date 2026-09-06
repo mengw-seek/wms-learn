@@ -8,7 +8,7 @@
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 学生时期练手项目，本来是学的java，了解了业务之后，用ruoyi做了一个简单的wms系统。但又想转go了，于是用ai重构了项目
-大体代码逻辑看完了，但一些其他的，比如配置环境等还没有看，对go还是有一些生疏
+大体代码逻辑看完了，但一些其他的，比如配置环境等还没有看
 
 
 单体后端（Go / Gin / GORM / MySQL / Redis）+ 前端（Vue3 / TypeScript / Element Plus / Pinia）的**开箱即用 WMS**。
