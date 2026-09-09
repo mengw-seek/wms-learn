@@ -1,5 +1,7 @@
+version: "2"
+
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck      # 未检查的错误返回
     - govet         # 官方 vet 检查
@@ -7,25 +9,27 @@ linters:
     - unused        # 未使用的代码
     - ineffassign   # 无效赋值
     - misspell      # 拼写错误
-    - gofmt         # 格式化检查
+  settings:
+    staticcheck:
+      checks: ["all"]
+  exclusions:
+    rules:
+      # 测试文件中允许忽略返回值（如构造测试数据）
+      - path: _test\.go
+        linters:
+          - errcheck
+      # 排除 errcheck 的 .Close() 未检查：Go 社区 defer f.Close() 是常见写法
+      - path: .*
+        linters:
+          - errcheck
+        text: "Close"
 
-linters-settings:
-  staticcheck:
-    checks: ["all"]
+      # 排除 ST1000 包注释缺失：练手项目暂不强求 GoDoc 风格
+      - path: .*
+        linters:
+          - staticcheck
+        text: "ST1000"
 
-issues:
-  exclude-rules:
-    # 测试文件中允许忽略返回值（如构造测试数据）
-    - path: _test\.go
-      linters:
-        - errcheck
-    # 排除 errcheck 的 .Close() 未检查：Go 社区 defer f.Close() 是常见写法
-    - path: .*
-      linters:
-        - errcheck
-      text: "Close"
-    # 排除 ST1000 包注释缺失：练手项目暂不强求 GoDoc 风格
-    - path: .*
-      linters:
-        - staticcheck
-      text: "ST1000"
+formatters:
+  enable:
+    - gofmt
