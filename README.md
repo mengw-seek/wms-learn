@@ -7,12 +7,16 @@
 ![Redis](https://img.shields.io/badge/Redis-可选·自动降级-DC382D?logo=redis&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
+学生时期练手项目，本来是学的java，了解了业务之后，用ruoyi做了一个简单的wms系统。但又想转go了，于是用ai重构了项目
+大体代码逻辑看完了，但一些其他的，比如配置环境等还没有看
+
+
 单体后端（Go / Gin / GORM / MySQL / Redis）+ 前端（Vue3 / TypeScript / Element Plus / Pinia）的**开箱即用 WMS**。
 覆盖 **入库 → 库存 → 出库 → 盘点** 完整业务闭环，以"功能简洁、工程亮点完整"为设计目标——可直接二开为小型仓库的生产系统，也适合逐模块学习仓储领域建模与 Go 工程实践。
 
-**30 秒了解它解决了什么**：库存并发不超卖（行锁 + 条件更新 + CHECK 三重防护，有测试证明）、每一件货的每一次变动都有流水可对账、单据状态机严格流转、审核即 FIFO 锁库、Excel 导入带断线补偿。
+**了解它解决了什么**：库存并发不超卖（行锁 + 条件更新 + CHECK 三重防护，有测试证明）、每一件货的每一次变动都有流水可对账、单据状态机严格流转、审核即 FIFO 锁库、Excel 导入带断线补偿。
 
-## 核心亮点（面试 / 学习重点）
+## 核心亮点
 
 | 亮点 | 代码落点 |
 | --- | --- |
@@ -27,14 +31,6 @@
 | 统一任务表 `wms_task`（收货/上架/拣货共用） | `internal/modules/task` |
 | JWT 认证 + 路由级权限串 + 异步操作日志审计 | `internal/modules/system`、`pkg/middleware` |
 
-## 文档导航（docs/）
-
-| 文档 | 内容 |
-| --- | --- |
-| [需求规格说明书](docs/requirements.md) | 背景/目标、角色权限、7 大模块功能需求、业务流程状态机、非功能需求 |
-| [系统架构设计](docs/architecture.md) | 模块化单体架构、分层与依赖规则、核心设计详解（防超卖/FIFO/状态机/单号/异步导入）、关键时序图、演进路线 |
-| [数据库设计](docs/database.md) | 18 张表总览、ER 图、核心表详解、索引与约束设计意图 |
-| [API 接口文档](docs/api.md) | 全部 30+ 端点、统一响应/认证/分页约定、请求示例 |
 
 ## 快速开始
 
@@ -97,15 +93,6 @@ wms/
 
 > 完整状态机图与角色权限矩阵见 [需求规格说明书](docs/requirements.md)。
 
-## 源码学习路线（建议顺序）
-
-1. **跑通业务**：按上面的顺序在前端走完入库/出库闭环，对流程建立直觉；
-2. **库存核心**：[inventory/service](internal/modules/inventory/service/service.go) → [repository](internal/modules/inventory/repository/repository.go)，看懂三数量与双重防超卖；
-3. **跑测试**：`make test`，读 [service_test.go](internal/modules/inventory/service/service_test.go) 理解并发测试怎么写；
-4. **出库编排**：[outbound/service](internal/modules/outbound/service/service.go)，看"审核即分配"如何在一个事务内跨模块协作；
-5. **工程机制**：`internal/pkg/tx`（事务边界）、`orderno`（单号降级）、`middleware`（JWT/权限/审计）；
-6. **可靠性样本**：[inbound/service](internal/modules/inbound/service/service.go) 的 Excel 异步导入（状态机/CAS/补偿）；
-7. **前端**：`web/src/api`（类型化请求层）→ `stores`（Pinia）→ 任一业务页面 → `style.css`（双主题令牌）。
 
 ## 测试
 
@@ -129,8 +116,5 @@ go test ./internal/modules/inventory/service/ -v
 
 ## 配置
 
-`configs/config.yaml`：MySQL DSN、Redis、JWT secret（**生产环境必须更换**）、上传目录、日志级别。
+`configs/config.yaml`：MySQL DSN、Redis、JWT secret、上传目录、日志级别。
 
-## License
-
-[MIT](LICENSE)
