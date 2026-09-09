@@ -17,11 +17,23 @@ const (
 )
 
 // StatusTransitions 状态转换表。
+// 审核即分配，SUBMITTED 审核通过后直接进入 PICKING（不停留 APPROVED）；
+// APPROVED 行保留兼容历史数据；终态 SHIPPED/CANCELLED 无后继。
 var StatusTransitions = map[OrderStatus][]OrderStatus{
 	OrderDraft:     {OrderSubmitted, OrderCancelled},
-	OrderSubmitted: {OrderApproved, OrderCancelled},
+	OrderSubmitted: {OrderPicking, OrderCancelled},
 	OrderApproved:  {OrderPicking, OrderCancelled},
-	OrderPicking:   {OrderShipped, OrderCancelled}, // PICKING 且未拣货可取消（释放库存）
+	OrderPicking:   {OrderShipped, OrderCancelled},
+}
+
+// CanTransit 判断状态是否允许从 from 流转到 to，是状态机校验的唯一入口。
+func CanTransit(from, to OrderStatus) bool {
+	for _, next := range StatusTransitions[from] {
+		if next == to {
+			return true
+		}
+	}
+	return false
 }
 
 type ShipmentOrder struct {

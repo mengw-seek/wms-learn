@@ -140,6 +140,10 @@ func (s *Service) Approve(ctx context.Context, id int64, operator string) error 
 		if o.Status != model.OrderSubmitted {
 			return errcode.OrderStatusWrong
 		}
+		// 状态机校验：SUBMITTED → APPROVED
+		if !model.CanTransit(o.Status, model.OrderApproved) {
+			return errcode.OrderStatusWrong
+		}
 		details, err := s.repo.ListDetails(tx, id)
 		if err != nil {
 			return err
@@ -169,9 +173,8 @@ func (s *Service) Cancel(ctx context.Context, id int64) error {
 		if err != nil {
 			return errcode.OrderNotFound
 		}
-		switch o.Status {
-		case model.OrderDraft, model.OrderSubmitted, model.OrderApproved:
-		default:
+		// 状态机校验：DRAFT/SUBMITTED/APPROVED 可取消；RECEIVING 之后不可取消
+		if !model.CanTransit(o.Status, model.OrderCancelled) {
 			return errcode.OrderStatusWrong
 		}
 		if n, err := s.repo.UpdateStatus(tx, id, o.Status, model.OrderCancelled); err != nil || n == 0 {
@@ -186,8 +189,13 @@ func (s *Service) Cancel(ctx context.Context, id int64) error {
 
 func (s *Service) transit(ctx context.Context, id int64, from, to model.OrderStatus) error {
 	return s.tm.Tx(ctx, func(tx *gorm.DB) error {
-		if _, err := s.repo.GetOrderForUpdate(tx, id); err != nil {
+		o, err := s.repo.GetOrderForUpdate(tx, id)
+		if err != nil {
 			return errcode.OrderNotFound
+		}
+		// 状态机校验：查转换表，非法流转（跨状态、终态再转、重复提交）一律拒绝
+		if !model.CanTransit(o.Status, to) {
+			return errcode.OrderStatusWrong
 		}
 		if n, err := s.repo.UpdateStatus(tx, id, from, to); err != nil || n == 0 {
 			if err != nil {
@@ -252,10 +260,11 @@ func (s *Service) Receive(ctx context.Context, orderID, detailID int64, req *dto
 				break
 			}
 		}
-		if o.Status == model.OrderApproved {
-			o.Status = model.OrderReceiving
-		}
 		if fullyReceived {
+			// 状态机校验：APPROVED（首次收货即收齐）或 RECEIVING → PUTAWAY
+			if !model.CanTransit(o.Status, model.OrderPutaway) {
+				return errcode.OrderStatusWrong
+			}
 			o.Status = model.OrderPutaway
 			// 收货完成 → 生成上架任务（残品不入库，上架量 = 已收 - 残品）
 			tasks := make([]*taskapi.CreateTask, 0, len(all))
@@ -274,6 +283,12 @@ func (s *Service) Receive(ctx context.Context, orderID, detailID int64, req *dto
 					return err
 				}
 			}
+		} else if o.Status == model.OrderApproved {
+			// 状态机校验：首次部分收货 APPROVED → RECEIVING
+			if !model.CanTransit(o.Status, model.OrderReceiving) {
+				return errcode.OrderStatusWrong
+			}
+			o.Status = model.OrderReceiving
 		}
 		return s.repo.UpdateOrderReceive(tx, o)
 	})
@@ -338,6 +353,10 @@ func (s *Service) Putaway(ctx context.Context, taskID, locationID int64, qty int
 			return err
 		}
 		if unfinished == 0 {
+			// 状态机校验：PUTAWAY → COMPLETED
+			if !model.CanTransit(o.Status, model.OrderCompleted) {
+				return errcode.OrderStatusWrong
+			}
 			if n, err := s.repo.UpdateStatus(tx, o.ID, model.OrderPutaway, model.OrderCompleted); err != nil {
 				return err
 			} else if n == 0 {

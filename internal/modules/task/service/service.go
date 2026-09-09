@@ -111,12 +111,19 @@ func (s *Service) progress(tx *gorm.DB, t *model.Task, qty int, operator string)
 	}
 	t.DoneQty += qty
 	t.Operator = operator
+	// 计算目标状态：首次报进度 → IN_PROGRESS；报满目标量 → COMPLETED（可一次直达）
+	next := t.Status
 	if t.Status == model.TaskCreated {
-		t.Status = model.TaskInProgress
+		next = model.TaskInProgress
 	}
 	if t.DoneQty == t.TargetQty {
-		t.Status = model.TaskCompleted
+		next = model.TaskCompleted
 	}
+	// 状态机校验：查转换表，非法流转（如已完成/已取消再报进度）拒绝
+	if next != t.Status && !model.CanTransit(t.Status, next) {
+		return errcode.TaskStatusWrong
+	}
+	t.Status = next
 	return s.repo.UpdateProgress(tx, t)
 }
 

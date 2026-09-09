@@ -18,12 +18,23 @@ const (
 )
 
 // StatusTransitions 状态转换表：只允许单向流转，非法流转返回错误。
+// APPROVED 可直达 PUTAWAY（首次收货即收齐）；终态 COMPLETED/CANCELLED 无后继。
 var StatusTransitions = map[OrderStatus][]OrderStatus{
 	OrderDraft:     {OrderSubmitted, OrderCancelled},
 	OrderSubmitted: {OrderApproved, OrderCancelled},
-	OrderApproved:  {OrderReceiving, OrderCancelled},
+	OrderApproved:  {OrderReceiving, OrderPutaway, OrderCancelled},
 	OrderReceiving: {OrderPutaway},
 	OrderPutaway:   {OrderCompleted},
+}
+
+// CanTransit 判断状态是否允许从 from 流转到 to，是状态机校验的唯一入口。
+func CanTransit(from, to OrderStatus) bool {
+	for _, next := range StatusTransitions[from] {
+		if next == to {
+			return true
+		}
+	}
+	return false
 }
 
 type ReceiptOrder struct {

@@ -23,6 +23,23 @@ const (
 	TaskCancelled  TaskStatus = "CANCELLED"
 )
 
+// StatusTransitions 任务状态转换表。
+// CREATED 可一次报满直达 COMPLETED；两个未完成态均可被取消；终态无后继。
+var StatusTransitions = map[TaskStatus][]TaskStatus{
+	TaskCreated:    {TaskInProgress, TaskCompleted, TaskCancelled},
+	TaskInProgress: {TaskCompleted, TaskCancelled},
+}
+
+// CanTransit 判断任务状态是否允许从 from 流转到 to。
+func CanTransit(from, to TaskStatus) bool {
+	for _, next := range StatusTransitions[from] {
+		if next == to {
+			return true
+		}
+	}
+	return false
+}
+
 // Task 统一任务表：任务状态只能单向流转，由 task.Service 校验。
 type Task struct {
 	model.Base

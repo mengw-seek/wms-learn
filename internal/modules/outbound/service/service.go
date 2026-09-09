@@ -86,10 +86,14 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 
 func (s *Service) Submit(ctx context.Context, id int64) error {
 	return s.tm.Tx(ctx, func(tx *gorm.DB) error {
-		if _, err := s.repo.GetOrderForUpdate(tx, id); err != nil {
+		o, err := s.repo.GetOrderForUpdate(tx, id)
+		if err != nil {
 			return errcode.ShipOrderNotFound
 		}
-		if n, err := s.repo.UpdateStatus(tx, id, model.OrderDraft, model.OrderSubmitted); err != nil {
+		if !model.CanTransit(o.Status, model.OrderSubmitted) {
+			return errcode.ShipOrderStatusWrong
+		}
+		if n, err := s.repo.UpdateStatus(tx, id, o.Status, model.OrderSubmitted); err != nil {
 			return err
 		} else if n == 0 {
 			return errcode.ShipOrderStatusWrong
@@ -149,7 +153,10 @@ func (s *Service) Approve(ctx context.Context, id int64, operator string) error 
 			return err
 		}
 
-		// 主单累加分配量，状态推进 SUBMITTED → PICKING
+		// 状态机校验 + 主单累加分配量，状态推进 SUBMITTED → PICKING（审核即分配）
+		if !model.CanTransit(o.Status, model.OrderPicking) {
+			return errcode.ShipOrderStatusWrong
+		}
 		o.AllocatedQty = o.ExpectedQty
 		o.Status = model.OrderPicking
 		if err := s.repo.UpdateOrderProgress(tx, o); err != nil {
@@ -176,6 +183,10 @@ func (s *Service) Cancel(ctx context.Context, id int64, operator string) error {
 		o, err := s.repo.GetOrderForUpdate(tx, id)
 		if err != nil {
 			return errcode.ShipOrderNotFound
+		}
+		// 状态机校验：终态 SHIPPED/CANCELLED 不在转换表中，直接拒绝取消
+		if !model.CanTransit(o.Status, model.OrderCancelled) {
+			return errcode.ShipOrderStatusWrong
 		}
 		switch o.Status {
 		case model.OrderDraft, model.OrderSubmitted:
@@ -285,9 +296,12 @@ func (s *Service) Pick(ctx context.Context, taskID int64, qty int, operator stri
 				return err
 			}
 		}
-		// 全部拣完 → SHIPPED
+		// 全部拣完 → SHIPPED（状态机校验 + CAS 兜底）
 		remaining := o.AllocatedQty - o.PickedQty
 		if remaining == 0 {
+			if !model.CanTransit(o.Status, model.OrderShipped) {
+				return errcode.ShipOrderStatusWrong
+			}
 			if n, err := s.repo.UpdateStatus(tx, o.ID, model.OrderPicking, model.OrderShipped); err != nil {
 				return err
 			} else if n == 0 {
