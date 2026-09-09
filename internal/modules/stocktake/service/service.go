@@ -122,7 +122,7 @@ func (s *Service) Approve(ctx context.Context, orderID int64, operator string) e
 		if n, err := s.repo.UpdateStatus(tx, orderID, model.OrderDraft, model.OrderCompleted); err != nil {
 			return err
 		} else if n == 0 {
-			return errcode.StocktakeStatusWrong
+			return errcode.StocktakeVersionBad
 		}
 		return nil
 	})
@@ -136,7 +136,7 @@ func (s *Service) Cancel(ctx context.Context, orderID int64) error {
 		if n, err := s.repo.UpdateStatus(tx, orderID, model.OrderDraft, model.OrderCancelled); err != nil {
 			return err
 		} else if n == 0 {
-			return errcode.StocktakeStatusWrong
+			return errcode.StocktakeVersionBad
 		}
 		return nil
 	})

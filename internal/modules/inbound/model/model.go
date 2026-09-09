@@ -17,6 +17,13 @@ const (
 	OrderCancelled OrderStatus = "CANCELLED"
 )
 
+// 单号前缀与来源标识。
+const (
+	OrderNoPrefix = "RK" // 入库单号前缀
+	SourceManual  = "MANUAL"
+	SourceImport  = "IMPORT"
+)
+
 // StatusTransitions 状态转换表：只允许单向流转，非法流转返回错误。
 // APPROVED 可直达 PUTAWAY（首次收货即收齐）；终态 COMPLETED/CANCELLED 无后继。
 var StatusTransitions = map[OrderStatus][]OrderStatus{

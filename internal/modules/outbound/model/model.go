@@ -16,6 +16,9 @@ const (
 	OrderCancelled OrderStatus = "CANCELLED"
 )
 
+// OrderNoPrefix 出库单号前缀。
+const OrderNoPrefix = "CK"
+
 // StatusTransitions 状态转换表。
 // 审核即分配，SUBMITTED 审核通过后直接进入 PICKING（不停留 APPROVED）；
 // APPROVED 行保留兼容历史数据；终态 SHIPPED/CANCELLED 无后继。

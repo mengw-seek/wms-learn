@@ -49,6 +49,20 @@ func excelizeOpenFile(path string) (*excelize.File, error) {
 	return excelize.OpenFile(path)
 }
 
+// Excel 异步导入 / 悬挂补偿相关调参。
+const (
+	importHeartbeatInterval  = 30 * time.Second // 处理中任务心跳间隔
+	compensateScanInterval   = 2 * time.Minute  // 悬挂任务扫描间隔
+	compensateLockTTL        = 5 * time.Minute  // 补偿分布式锁持有时长
+	pendingStaleThreshold    = 2 * time.Minute  // PENDING 超时阈值（超过未被抢占视为悬挂）
+	processingStaleThreshold = 5 * time.Minute  // PROCESSING 心跳超时阈值
+	staleScanLimit           = 10               // 单次扫描悬挂任务上限
+	maxImportErrMsgLen       = 1000             // 导入失败信息落库最大长度
+)
+
+// 分布式锁 key。
+const compensateLockKey = "wms:import:compensate"
+
 // ---------- 单据生命周期 ----------
 
 // Create 创建入库单（RK 单号；唯一索引兜底 + 重新生成重试 3 次）。
@@ -61,12 +75,12 @@ func (s *Service) Create(ctx context.Context, req *dto.CreateOrderReq, operator 
 		return nil, err
 	}
 	var order *model.ReceiptOrder
-	for i := 0; i < 3; i++ { // 单号冲突重试
+	for i := 0; i < tx.MaxOrderNoRetry; i++ { // 单号冲突重试
 		order = &model.ReceiptOrder{
 			Base:        sysmodel.Base{ID: snowflake.Next()},
-			OrderNo:     s.no.Next(ctx, "RK"),
+			OrderNo:     s.no.Next(ctx, model.OrderNoPrefix),
 			WarehouseID: req.WarehouseID, Status: model.OrderDraft,
-			Source: "MANUAL", Remark: req.Remark, ExpectedQty: expected, CreatedBy: operator,
+			Source: model.SourceManual, Remark: req.Remark, ExpectedQty: expected, CreatedBy: operator,
 		}
 		err = s.tm.Tx(ctx, func(tx *gorm.DB) error {
 			return s.repo.CreateOrder(tx, order, details)
@@ -74,7 +88,7 @@ func (s *Service) Create(ctx context.Context, req *dto.CreateOrderReq, operator 
 		if err == nil {
 			return order, nil
 		}
-		if !isDuplicateErr(err) {
+		if !tx.IsDuplicateErr(err) {
 			return nil, err
 		}
 		log.WithContext(ctx).Warn("order_no duplicated, retry", "order_no", order.OrderNo)
@@ -102,11 +116,15 @@ func (s *Service) Update(ctx context.Context, id int64, req *dto.CreateOrderReq)
 		o.WarehouseID = req.WarehouseID
 		o.Remark = req.Remark
 		o.ExpectedQty = expected
-		if err := tx.Model(o).Updates(map[string]any{
+		res := tx.Model(&model.ReceiptOrder{}).Where("id = ? AND version = ?", id, o.Version).Updates(map[string]any{
 			"warehouse_id": o.WarehouseID, "remark": o.Remark, "expected_qty": o.ExpectedQty,
-			"version": o.Version + 1,
-		}).Error; err != nil {
-			return err
+			"version": gorm.Expr("version + 1"),
+		})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return errcode.OrderVersionBad
 		}
 		return s.repo.ReplaceDetails(tx, id, details)
 	})
@@ -132,6 +150,7 @@ func (s *Service) Submit(ctx context.Context, id int64) error {
 
 // Approve 审核：SUBMITTED → APPROVED，并生成收货任务。
 func (s *Service) Approve(ctx context.Context, id int64, operator string) error {
+	_ = operator // 预留：任务创建暂不记录操作人，保持与其他生命周期方法签名一致
 	return s.tm.Tx(ctx, func(tx *gorm.DB) error {
 		o, err := s.repo.GetOrderForUpdate(tx, id)
 		if err != nil {
@@ -161,7 +180,6 @@ func (s *Service) Approve(ctx context.Context, id int64, operator string) error 
 				DetailID: d.ID, SKUID: d.SKUID, WarehouseID: o.WarehouseID, TargetQty: d.ExpectedQty,
 			})
 		}
-		_ = operator
 		return s.taskAPI.Create(ctx, tx, tasks)
 	})
 }
@@ -194,14 +212,14 @@ func (s *Service) transit(ctx context.Context, id int64, from, to model.OrderSta
 			return errcode.OrderNotFound
 		}
 		// 状态机校验：查转换表，非法流转（跨状态、终态再转、重复提交）一律拒绝
-		if !model.CanTransit(o.Status, to) {
+		if !model.CanTransit(o.Status, to) || o.Status != from {
 			return errcode.OrderStatusWrong
 		}
-		if n, err := s.repo.UpdateStatus(tx, id, from, to); err != nil || n == 0 {
-			if err != nil {
-				return err
-			}
-			return errcode.OrderStatusWrong
+		if n, err := s.repo.UpdateStatus(tx, id, o.Status, to); err != nil {
+			return err
+		} else if n == 0 {
+			// 行锁内仍 CAS 失败：并发状态变更，语义为版本冲突而非状态非法
+			return errcode.OrderVersionBad
 		}
 		return nil
 	})
@@ -211,8 +229,9 @@ func (s *Service) transit(ctx context.Context, id int64, from, to model.OrderSta
 
 // Receive 分次收货：累计不超过预期数量，记录残品；首次收货录入批次号。
 // 全部收完后同事务生成上架任务，单据流转 RECEIVING → PUTAWAY。
+// 并发收货/死锁由 TxRetry 自动整事务重试；数量累加全部使用数据库原子递增。
 func (s *Service) Receive(ctx context.Context, orderID, detailID int64, req *dto.ReceiveReq, operator string) error {
-	return s.tm.Tx(ctx, func(tx *gorm.DB) error {
+	return s.tm.TxRetry(ctx, tx.MaxTxRetry, func(tx *gorm.DB) error {
 		o, err := s.repo.GetOrderForUpdate(tx, orderID)
 		if err != nil {
 			return errcode.OrderNotFound
@@ -238,35 +257,49 @@ func (s *Service) Receive(ctx context.Context, orderID, detailID int64, req *dto
 			}
 			d.BatchNo = req.BatchNo
 		} else if req.BatchNo != "" && req.BatchNo != d.BatchNo {
-			return errcode.New(40014, "同一明细的批次号必须与首次收货一致")
+			return errcode.BatchNoInconsistent
 		}
-		d.ReceivedQty += req.Qty
-		d.DefectiveQty += req.DefectiveQty
-		if err := s.repo.UpdateDetailReceive(tx, d); err != nil {
+		// 明细原子累加（批次号仅首次落库）
+		if err := s.repo.IncrDetailReceive(tx, d, req.Qty, req.DefectiveQty); err != nil {
 			return err
 		}
 
-		// 主单累计
-		o.ReceivedQty += req.Qty
-		o.DefectiveQty += req.DefectiveQty
-		fullyReceived := true
+		// 重读全部明细（同事务可见原子累加后的新值）判断是否全部收齐
 		all, err := s.repo.ListDetails(tx, orderID)
 		if err != nil {
 			return err
 		}
+		fullyReceived := true
 		for _, item := range all {
 			if item.ReceivedQty+item.DefectiveQty < item.ExpectedQty {
 				fullyReceived = false
 				break
 			}
 		}
+		var toStatus model.OrderStatus
 		if fullyReceived {
 			// 状态机校验：APPROVED（首次收货即收齐）或 RECEIVING → PUTAWAY
 			if !model.CanTransit(o.Status, model.OrderPutaway) {
 				return errcode.OrderStatusWrong
 			}
-			o.Status = model.OrderPutaway
-			// 收货完成 → 生成上架任务（残品不入库，上架量 = 已收 - 残品）
+			toStatus = model.OrderPutaway
+		} else if o.Status == model.OrderApproved {
+			// 状态机校验：首次部分收货 APPROVED → RECEIVING
+			if !model.CanTransit(o.Status, model.OrderReceiving) {
+				return errcode.OrderStatusWrong
+			}
+			toStatus = model.OrderReceiving
+		} else {
+			toStatus = o.Status // RECEIVING 中继续收货，状态不变
+		}
+		// 主单原子累加 + 状态推进（version 乐观锁，冲突由 TxRetry 重试）
+		if n, err := s.repo.IncrOrderReceive(tx, o.ID, o.Version, req.Qty, req.DefectiveQty, toStatus); err != nil {
+			return err
+		} else if n == 0 {
+			return errcode.OrderVersionBad
+		}
+		// 收齐 → 生成上架任务（残品不入库，上架量 = 已收 - 残品）
+		if fullyReceived {
 			tasks := make([]*taskapi.CreateTask, 0, len(all))
 			for _, item := range all {
 				putawayQty := item.ReceivedQty - item.DefectiveQty
@@ -283,14 +316,8 @@ func (s *Service) Receive(ctx context.Context, orderID, detailID int64, req *dto
 					return err
 				}
 			}
-		} else if o.Status == model.OrderApproved {
-			// 状态机校验：首次部分收货 APPROVED → RECEIVING
-			if !model.CanTransit(o.Status, model.OrderReceiving) {
-				return errcode.OrderStatusWrong
-			}
-			o.Status = model.OrderReceiving
 		}
-		return s.repo.UpdateOrderReceive(tx, o)
+		return nil
 	})
 }
 
@@ -298,24 +325,34 @@ func (s *Service) Receive(ctx context.Context, orderID, detailID int64, req *dto
 
 // Putaway 上架执行：指定库位 + 数量，调用 inventory.Increase 增加库存，库位标记占用。
 // 全部上架任务完成后单据流转 COMPLETED。支持分多次上架。
+// 并发上架/死锁由 TxRetry 自动整事务重试。
 func (s *Service) Putaway(ctx context.Context, taskID, locationID int64, qty int, operator string) error {
 	if err := s.basic.ValidateLocation(ctx, locationID); err != nil {
 		return err
 	}
-	return s.tm.Tx(ctx, func(tx *gorm.DB) error {
-		t, err := s.taskAPI.Get(ctx, taskID)
-		if err != nil {
-			return errcode.TaskNotFound
-		}
-		if t.TaskType != taskmodel.TaskPutaway {
-			return errcode.TaskStatusWrong
-		}
-		o, err := s.repo.GetOrderForUpdate(tx, t.OrderID)
+	// 事务外只读不可变路由信息（OrderID/DetailID/SKUID/TaskType/TaskNo 建后不变）
+	routing, err := s.taskAPI.Get(ctx, taskID)
+	if err != nil {
+		return errcode.TaskNotFound
+	}
+	if routing.TaskType != taskmodel.TaskPutaway {
+		return errcode.TaskStatusWrong
+	}
+	return s.tm.TxRetry(ctx, tx.MaxTxRetry, func(tx *gorm.DB) error {
+		o, err := s.repo.GetOrderForUpdate(tx, routing.OrderID)
 		if err != nil {
 			return errcode.OrderNotFound
 		}
 		if o.Status != model.OrderPutaway {
 			return errcode.OrderStatusWrong
+		}
+		// 事务内行锁读取任务：权威校验任务未被并发取消
+		t, err := s.taskAPI.GetForUpdate(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if t.Status != taskmodel.TaskCreated && t.Status != taskmodel.TaskInProgress {
+			return errcode.TaskStatusWrong
 		}
 		var detail *model.ReceiptOrderDetail
 		details, err := s.repo.ListDetails(tx, o.ID)
@@ -323,7 +360,7 @@ func (s *Service) Putaway(ctx context.Context, taskID, locationID int64, qty int
 			return err
 		}
 		for _, d := range details {
-			if d.ID == t.DetailID {
+			if d.ID == routing.DetailID {
 				detail = d
 				break
 			}
@@ -333,9 +370,9 @@ func (s *Service) Putaway(ctx context.Context, taskID, locationID int64, qty int
 		}
 		// 库存生效：上架时才增加库存
 		if err := s.inv.Increase(ctx, tx, &invapi.IncreaseReq{
-			WarehouseID: o.WarehouseID, LocationID: locationID, SKUID: t.SKUID,
+			WarehouseID: o.WarehouseID, LocationID: locationID, SKUID: routing.SKUID,
 			BatchNo: detail.BatchNo, Quantity: qty,
-			OrderNo: o.OrderNo, TaskNo: t.TaskNo, Operator: operator,
+			OrderNo: o.OrderNo, TaskNo: routing.TaskNo, Operator: operator,
 		}); err != nil {
 			return err
 		}
@@ -384,7 +421,7 @@ func (s *Service) Get(ctx context.Context, id int64) (*OrderDetail, error) {
 	if err != nil {
 		return nil, err
 	}
-	tasks, _, err := s.taskAPI.List(ctx, id, "", 1, 100)
+	tasks, _, err := s.taskAPI.List(ctx, id, "", 1, taskapi.DetailTaskPageSize)
 	if err != nil {
 		return nil, err
 	}
@@ -404,7 +441,7 @@ func (s *Service) buildDetails(ctx context.Context, items []dto.OrderDetailItem)
 	seen := map[int64]struct{}{}
 	for _, it := range items {
 		if _, dup := seen[it.SKUID]; dup {
-			return nil, 0, errcode.New(40015, "同一货品请合并为一行明细")
+			return nil, 0, errcode.DetailDuplicateSKU
 		}
 		seen[it.SKUID] = struct{}{}
 		sku, err := s.basic.GetSKU(ctx, it.SKUID)
@@ -419,10 +456,6 @@ func (s *Service) buildDetails(ctx context.Context, items []dto.OrderDetailItem)
 		expected += it.ExpectedQty
 	}
 	return details, expected, nil
-}
-
-func isDuplicateErr(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate")
 }
 
 // ---------- Excel 异步导入 ----------
@@ -469,7 +502,7 @@ func (s *Service) processImport(taskID string) {
 	// 心跳：长任务定期刷新 updated_at，防止被悬挂补偿误判
 	stopHeartbeat := make(chan struct{})
 	go func() {
-		t := time.NewTicker(30 * time.Second)
+		t := time.NewTicker(importHeartbeatInterval)
 		defer t.Stop()
 		for {
 			select {
@@ -554,17 +587,17 @@ func (s *Service) doImport(ctx context.Context, t *model.ImportTask) (total, suc
 	}
 	if len(failMsgs) > 0 {
 		errMsg = strings.Join(failMsgs, "; ")
-		if len(errMsg) > 1000 {
-			errMsg = errMsg[:1000]
+		if len(errMsg) > maxImportErrMsgLen {
+			errMsg = errMsg[:maxImportErrMsgLen]
 		}
 	}
 	return total, success, fail, errMsg
 }
 
-// StartCompensator 悬挂任务补偿：每 2 分钟扫描超时任务，CAS 抢占后重新执行。
+// StartCompensator 悬挂任务补偿：按固定间隔扫描超时任务，CAS 抢占后重新执行。
 func (s *Service) StartCompensator(ctx context.Context) {
 	go func() {
-		ticker := time.NewTicker(2 * time.Minute)
+		ticker := time.NewTicker(compensateScanInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -581,7 +614,7 @@ func (s *Service) compensateOnce() {
 	ctx := context.Background()
 	// 多实例部署时用分布式锁防止重复补偿；Redis 故障降级为直接执行（单实例语义）。
 	if s.locker != nil {
-		release, ok, err := s.locker.Lock(ctx, "wms:import:compensate", 5*time.Minute)
+		release, ok, err := s.locker.Lock(ctx, compensateLockKey, compensateLockTTL)
 		if err != nil {
 			log.L().Warn("compensate lock unavailable, run in standalone mode", "err", err)
 		} else if !ok {
@@ -591,7 +624,8 @@ func (s *Service) compensateOnce() {
 		}
 	}
 	now := time.Now()
-	stale, err := s.repo.ListStaleImports(ctx, s.tm.DB(), now.Add(-2*time.Minute), now.Add(-5*time.Minute))
+	stale, err := s.repo.ListStaleImports(ctx, s.tm.DB(),
+		now.Add(-pendingStaleThreshold), now.Add(-processingStaleThreshold), staleScanLimit)
 	if err != nil {
 		log.L().Error("scan stale imports failed", "err", err)
 		return

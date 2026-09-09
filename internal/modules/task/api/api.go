@@ -20,6 +20,9 @@ type CreateTask struct {
 	TargetQty    int
 }
 
+// DetailTaskPageSize 单据详情页加载该单全部任务时使用的页大小（任务数不会很大，一次取足）。
+const DetailTaskPageSize = 200
+
 // TaskAPI task 模块对外接口：inbound / outbound 通过它操作统一任务表。
 type TaskAPI interface {
 	// Create 在业务事务内批量创建任务。
@@ -32,6 +35,9 @@ type TaskAPI interface {
 	CountUnfinished(ctx context.Context, tx *gorm.DB, orderID int64, taskType model.TaskType) (int64, error)
 	// CancelByOrder 取消单据下所有未完成任务（同事务调用）。
 	CancelByOrder(ctx context.Context, tx *gorm.DB, orderID int64) error
+	// GetForUpdate 事务内行锁读取任务：执行拣货/上架前在同一事务内锁定并校验任务状态，
+	// 避免事务外读到已被并发取消的任务（与 AddProgress 的锁读语义一致）。
+	GetForUpdate(ctx context.Context, tx *gorm.DB, taskID int64) (*model.Task, error)
 	// List 查询任务（只读，使用非事务连接）。
 	List(ctx context.Context, orderID int64, taskType string, page, size int) ([]*model.Task, int64, error)
 	Get(ctx context.Context, taskID int64) (*model.Task, error)

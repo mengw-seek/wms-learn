@@ -28,18 +28,13 @@ func (r *Repository) GetForUpdate(tx *gorm.DB, id int64) (*model.Task, error) {
 	return &t, nil
 }
 
-// UpdateProgress 推进任务状态与完成量（乐观锁 version 防护）。
-func (r *Repository) UpdateProgress(tx *gorm.DB, t *model.Task) error {
+// UpdateProgress 推进任务状态与完成量（version 乐观锁防护）。
+// 返回 RowsAffected：0 表示版本冲突（任务已被并发事务推进），调用方应返回冲突错误。
+func (r *Repository) UpdateProgress(tx *gorm.DB, t *model.Task) (int64, error) {
 	res := tx.Model(&model.Task{}).Where("id = ? AND version = ?", t.ID, t.Version).Updates(map[string]any{
 		"done_qty": t.DoneQty, "status": t.Status, "operator": t.Operator, "version": t.Version + 1,
 	})
-	if res.Error != nil {
-		return res.Error
-	}
-	if res.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
+	return res.RowsAffected, res.Error
 }
 
 // GetByDetailForUpdate 事务内按明细锁定任务（收货/上架按明细推进）。

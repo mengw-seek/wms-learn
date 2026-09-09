@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"sort"
-	"strings"
 
 	"gorm.io/gorm"
 
@@ -51,9 +50,9 @@ func (s *Service) Create(ctx context.Context, req *dto.CreateOrderReq, operator 
 		return nil, err
 	}
 	var order *model.ShipmentOrder
-	for i := 0; i < 3; i++ {
+	for i := 0; i < tx.MaxOrderNoRetry; i++ {
 		order = &model.ShipmentOrder{
-			Base: sysmodel.Base{ID: snowflake.Next()}, OrderNo: s.no.Next(ctx, "CK"),
+			Base: sysmodel.Base{ID: snowflake.Next()}, OrderNo: s.no.Next(ctx, model.OrderNoPrefix),
 			BizOrderNo: req.BizOrderNo, WarehouseID: req.WarehouseID,
 			Status: model.OrderDraft, Remark: req.Remark, ExpectedQty: expected, CreatedBy: operator,
 		}
@@ -63,7 +62,7 @@ func (s *Service) Create(ctx context.Context, req *dto.CreateOrderReq, operator 
 		if err == nil {
 			return order, nil
 		}
-		if !isDuplicateErr(err) {
+		if !tx.IsDuplicateErr(err) {
 			return nil, err
 		}
 		log.WithContext(ctx).Warn("order_no duplicated, retry", "order_no", order.OrderNo)
@@ -96,7 +95,7 @@ func (s *Service) Submit(ctx context.Context, id int64) error {
 		if n, err := s.repo.UpdateStatus(tx, id, o.Status, model.OrderSubmitted); err != nil {
 			return err
 		} else if n == 0 {
-			return errcode.ShipOrderStatusWrong
+			return errcode.ShipOrderVersionBad
 		}
 		return nil
 	})
@@ -159,8 +158,10 @@ func (s *Service) Approve(ctx context.Context, id int64, operator string) error 
 		}
 		o.AllocatedQty = o.ExpectedQty
 		o.Status = model.OrderPicking
-		if err := s.repo.UpdateOrderProgress(tx, o); err != nil {
+		if n, err := s.repo.UpdateOrderProgress(tx, o); err != nil {
 			return err
+		} else if n == 0 {
+			return errcode.ShipOrderVersionBad
 		}
 
 		// 按分配行生成拣货任务
@@ -236,59 +237,71 @@ func (s *Service) Cancel(ctx context.Context, id int64, operator string) error {
 
 // ---------- 拣货/发货 ----------
 
-// Pick 拣货执行：分次拣货，分配行拣完自动发货扣减 inventory.Ship。
+// Pick 拣货执行：分次拣货，分配行拣满自动发货扣减 inventory.Ship。
 // 全部分配行拣完 → 单据 SHIPPED。
+// 并发拣货/死锁由 TxRetry 自动整事务重试；数量累加全部使用数据库原子递增。
 func (s *Service) Pick(ctx context.Context, taskID int64, qty int, operator string) error {
-	return s.tm.Tx(ctx, func(tx *gorm.DB) error {
-		t, err := s.taskAPI.Get(ctx, taskID)
-		if err != nil {
-			return errcode.TaskNotFound
-		}
-		if t.TaskType != taskmodel.TaskPick {
-			return errcode.TaskStatusWrong
-		}
-		o, err := s.repo.GetOrderForUpdate(tx, t.OrderID)
+	// 事务外只读不可变路由信息（OrderID/AllocationID/TaskType/TaskNo 建后不变）
+	routing, err := s.taskAPI.Get(ctx, taskID)
+	if err != nil {
+		return errcode.TaskNotFound
+	}
+	if routing.TaskType != taskmodel.TaskPick {
+		return errcode.TaskStatusWrong
+	}
+	return s.tm.TxRetry(ctx, tx.MaxTxRetry, func(tx *gorm.DB) error {
+		// 锁顺序：主单 → 任务 → 分配行（与 Cancel 的 单据→分配行→任务 保持一致，降低死锁概率）
+		o, err := s.repo.GetOrderForUpdate(tx, routing.OrderID)
 		if err != nil {
 			return errcode.ShipOrderNotFound
 		}
 		if o.Status != model.OrderPicking {
 			return errcode.ShipOrderStatusWrong
 		}
-		a, err := s.repo.GetAllocationForUpdate(tx, t.AllocationID)
+		// 事务内行锁读取任务：权威校验任务未被并发取消（AddProgress 内部也会锁读复核）
+		t, err := s.taskAPI.GetForUpdate(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if t.Status != taskmodel.TaskCreated && t.Status != taskmodel.TaskInProgress {
+			return errcode.TaskStatusWrong
+		}
+		a, err := s.repo.GetAllocationForUpdate(tx, routing.AllocationID)
 		if err != nil {
 			return errcode.ShipOrderNotFound
 		}
 		if a.Status != model.AllocAllocated {
 			return errcode.TaskStatusWrong
 		}
-		// 推进拣货任务（内部校验数量不超剩余）
+		// 推进拣货任务（内部行锁 + 校验数量不超剩余 + 任务状态机）
 		if err := s.taskAPI.AddProgress(ctx, tx, taskID, qty, operator); err != nil {
 			return err
 		}
-		// 分配行累计
-		a.PickedQty += qty
-		if a.PickedQty == a.AllocatedQty {
-			a.Status = model.AllocPicked
+		// 分配行原子累加；拣满置 PICKED（行已锁，base+delta 即更新后值，用于决策）
+		newAllocPicked := a.PickedQty + qty
+		allocToStatus := model.AllocAllocated
+		allocFullyPicked := newAllocPicked == a.AllocatedQty
+		if allocFullyPicked {
+			allocToStatus = model.AllocPicked
 		}
-		if err := s.repo.UpdateAllocationPicked(tx, a); err != nil {
+		if n, err := s.repo.IncrAllocationPicked(tx, a, qty, allocToStatus); err != nil {
 			return err
+		} else if n == 0 {
+			return errcode.AllocConflict
 		}
-		// 主单/明细累计
-		o.PickedQty += qty
-		if err := s.repo.UpdateOrderProgress(tx, o); err != nil {
+		// 主单原子累加拣货量（不依赖内存对象回写）
+		if n, err := s.repo.IncrOrderPicked(tx, o.ID, o.Version, qty); err != nil {
 			return err
+		} else if n == 0 {
+			return errcode.ShipOrderVersionBad
 		}
-		d, err := s.repo.GetDetailForUpdate(tx, a.DetailID)
-		if err != nil {
-			return errcode.ShipOrderNotFound
-		}
-		d.PickedQty += qty
-		if err := s.repo.UpdateDetailPicked(tx, d); err != nil {
+		// 明细原子累加
+		if err := s.repo.IncrDetailPicked(tx, a.DetailID, qty); err != nil {
 			return err
 		}
 
-		// 分配行拣完 → 发货扣减库存
-		if a.Status == model.AllocPicked {
+		// 分配行拣满 → 发货扣减库存
+		if allocFullyPicked {
 			if err := s.inv.Ship(ctx, tx, &invapi.ShipReq{
 				InventoryID: a.InventoryID, Quantity: a.AllocatedQty,
 				OrderNo: o.OrderNo, TaskNo: t.TaskNo, Operator: operator,
@@ -296,9 +309,9 @@ func (s *Service) Pick(ctx context.Context, taskID int64, qty int, operator stri
 				return err
 			}
 		}
-		// 全部拣完 → SHIPPED（状态机校验 + CAS 兜底）
-		remaining := o.AllocatedQty - o.PickedQty
-		if remaining == 0 {
+		// 主单全部拣完 → SHIPPED（行锁内 base+delta 决策，状态机校验 + CAS 兜底）
+		newOrderPicked := o.PickedQty + qty
+		if o.AllocatedQty-newOrderPicked == 0 {
 			if !model.CanTransit(o.Status, model.OrderShipped) {
 				return errcode.ShipOrderStatusWrong
 			}
@@ -334,7 +347,7 @@ func (s *Service) Get(ctx context.Context, id int64) (*OrderDetail, error) {
 	if err != nil {
 		return nil, err
 	}
-	tasks, _, err := s.taskAPI.List(ctx, id, "", 1, 200)
+	tasks, _, err := s.taskAPI.List(ctx, id, "", 1, taskapi.DetailTaskPageSize)
 	if err != nil {
 		return nil, err
 	}
@@ -353,7 +366,7 @@ func (s *Service) buildDetails(ctx context.Context, items []dto.OrderDetailItem)
 	seen := map[int64]struct{}{}
 	for _, it := range items {
 		if _, dup := seen[it.SKUID]; dup {
-			return nil, 0, errcode.New(50007, "同一货品请合并为一行明细")
+			return nil, 0, errcode.ShipDetailDuplicateSKU
 		}
 		seen[it.SKUID] = struct{}{}
 		sku, err := s.basic.GetSKU(ctx, it.SKUID)
@@ -367,8 +380,4 @@ func (s *Service) buildDetails(ctx context.Context, items []dto.OrderDetailItem)
 		expected += it.ExpectedQty
 	}
 	return details, expected, nil
-}
-
-func isDuplicateErr(err error) bool {
-	return err != nil && strings.Contains(strings.ToLower(err.Error()), "duplicate")
 }

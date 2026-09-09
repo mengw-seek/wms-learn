@@ -88,19 +88,28 @@ func (r *Repository) GetDetailForUpdate(tx *gorm.DB, detailID int64) (*model.Rec
 	return &d, nil
 }
 
-// UpdateDetailReceive 累加明细收货/残品数，并可落批次号。
-func (r *Repository) UpdateDetailReceive(tx *gorm.DB, d *model.ReceiptOrderDetail) error {
-	return tx.Model(&model.ReceiptOrderDetail{}).Where("id = ?", d.ID).Updates(map[string]any{
-		"received_qty": d.ReceivedQty, "defective_qty": d.DefectiveQty, "batch_no": d.BatchNo,
-	}).Error
+// IncrDetailReceive 原子累加明细收货/残品数，首次收货落批次号（明细行已锁）。
+func (r *Repository) IncrDetailReceive(tx *gorm.DB, d *model.ReceiptOrderDetail, qtyDelta, defectiveDelta int) error {
+	updates := map[string]any{
+		"received_qty":  gorm.Expr("received_qty + ?", qtyDelta),
+		"defective_qty": gorm.Expr("defective_qty + ?", defectiveDelta),
+	}
+	if d.BatchNo != "" { // 首次收货：批次号落库；后续批次号已存在，无需回写
+		updates["batch_no"] = d.BatchNo
+	}
+	return tx.Model(&model.ReceiptOrderDetail{}).Where("id = ?", d.ID).Updates(updates).Error
 }
 
-// UpdateOrderReceive 累加主单收货/残品数并推进状态。
-func (r *Repository) UpdateOrderReceive(tx *gorm.DB, o *model.ReceiptOrder) error {
-	return tx.Model(&model.ReceiptOrder{}).Where("id = ? AND version = ?", o.ID, o.Version).Updates(map[string]any{
-		"received_qty": o.ReceivedQty, "defective_qty": o.DefectiveQty,
-		"status": o.Status, "version": o.Version + 1,
-	}).Error
+// IncrOrderReceive 原子累加主单收货/残品数并推进状态（version 乐观锁）。
+// 返回 RowsAffected：0 表示版本冲突，调用方应返回 VersionBad 或重试。
+func (r *Repository) IncrOrderReceive(tx *gorm.DB, id int64, version int, qtyDelta, defectiveDelta int, toStatus model.OrderStatus) (int64, error) {
+	res := tx.Model(&model.ReceiptOrder{}).Where("id = ? AND version = ?", id, version).Updates(map[string]any{
+		"received_qty":  gorm.Expr("received_qty + ?", qtyDelta),
+		"defective_qty": gorm.Expr("defective_qty + ?", defectiveDelta),
+		"status":        toStatus,
+		"version":       gorm.Expr("version + 1"),
+	})
+	return res.RowsAffected, res.Error
 }
 
 func (r *Repository) ListOrders(ctx context.Context, db *gorm.DB, warehouseID int64, status, keyword string, page, size int) ([]*model.ReceiptOrder, int64, error) {
@@ -159,13 +168,13 @@ func (r *Repository) TouchImport(db *gorm.DB, taskID string) error {
 	return db.Model(&model.ImportTask{}).Where("task_id = ?", taskID).Update("updated_at", gorm.Expr("NOW()")).Error
 }
 
-// ListStaleImports 悬挂任务扫描：PENDING 超时 / PROCESSING 心跳超时。
-func (r *Repository) ListStaleImports(ctx context.Context, db *gorm.DB, pendingBefore, processingBefore time.Time) ([]*model.ImportTask, error) {
+// ListStaleImports 悬挂任务扫描：PENDING 超时 / PROCESSING 心跳超时，最多返回 limit 条。
+func (r *Repository) ListStaleImports(ctx context.Context, db *gorm.DB, pendingBefore, processingBefore time.Time, limit int) ([]*model.ImportTask, error) {
 	var list []*model.ImportTask
 	err := db.WithContext(ctx).Model(&model.ImportTask{}).
 		Where("(status = ? AND updated_at < ?) OR (status = ? AND updated_at < ?)",
 			model.ImportPending, pendingBefore, model.ImportProcessing, processingBefore).
-		Limit(10).Find(&list).Error
+		Limit(limit).Find(&list).Error
 	return list, err
 }
 

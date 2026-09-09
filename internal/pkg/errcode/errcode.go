@@ -23,6 +23,26 @@ func From(err error) *Error {
 	return Internal
 }
 
+// conflictCodes 可安全重试的并发冲突错误码集合：乐观锁版本冲突 / 行竞争 / 死锁语义冲突。
+var conflictCodes = map[int]struct{}{
+	40900: {}, // Conflict 通用并发冲突
+	40003: {}, // 入库单版本冲突
+	50003: {}, // 出库单版本冲突
+	50201: {}, // 分配并发冲突
+	50202: {}, // 发货并发冲突
+	60005: {}, // 盘点单版本冲突
+}
+
+// IsConflict 判断错误是否为并发冲突类（乐观锁失败、行竞争）——这类错误可以整事务重试。
+func IsConflict(err error) bool {
+	e, ok := err.(*Error)
+	if !ok {
+		return false
+	}
+	_, ok = conflictCodes[e.Code]
+	return ok
+}
+
 // 通用错误码
 var (
 	OK           = New(0, "success")
@@ -90,18 +110,21 @@ var (
 	ImportFileInvalid    = New(40011, "导入文件无效")
 	ImportTemplateHeader = New(40012, "导入文件表头不符合模板")
 	TaskQtyOver          = New(40013, "数量超过任务剩余数量")
+	BatchNoInconsistent  = New(40014, "同一明细的批次号必须与首次收货一致")
+	DetailDuplicateSKU   = New(40015, "同一货品请合并为一行明细")
 )
 
 // 出库 50000+
 var (
-	ShipOrderNotFound    = New(50001, "出库单不存在")
-	ShipOrderStatusWrong = New(50002, "出库单状态不允许该操作")
-	ShipOrderVersionBad  = New(50003, "出库单已被其他人操作，请刷新重试")
-	ShipQtyOver          = New(50004, "拣货数量超过任务剩余数量")
-	BizOrderDuplicate    = New(50005, "业务订单号已存在")
-	AllocConflict        = New(50201, "分配并发冲突，请重试")
-	ShipConflict         = New(50202, "发货并发冲突，请重试")
-	ShipShippedForbidden = New(50006, "出库单已进入拣货/发货，禁止取消")
+	ShipOrderNotFound      = New(50001, "出库单不存在")
+	ShipOrderStatusWrong   = New(50002, "出库单状态不允许该操作")
+	ShipOrderVersionBad    = New(50003, "出库单已被其他人操作，请刷新重试")
+	ShipQtyOver            = New(50004, "拣货数量超过任务剩余数量")
+	BizOrderDuplicate      = New(50005, "业务订单号已存在")
+	AllocConflict          = New(50201, "分配并发冲突，请重试")
+	ShipConflict           = New(50202, "发货并发冲突，请重试")
+	ShipShippedForbidden   = New(50006, "出库单已进入拣货/发货，禁止取消")
+	ShipDetailDuplicateSKU = New(50007, "同一货品请合并为一行明细")
 )
 
 // 盘点 60000+
@@ -110,4 +133,5 @@ var (
 	StocktakeStatusWrong = New(60002, "盘点单状态不允许该操作")
 	StocktakeQtyInvalid  = New(60003, "实盘数量非法")
 	StocktakeNoDetail    = New(60004, "盘点单没有可盘点的库存明细")
+	StocktakeVersionBad  = New(60005, "盘点单已被其他人操作，请刷新重试")
 )

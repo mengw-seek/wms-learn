@@ -88,18 +88,31 @@ func (r *Repository) UpdateDetailAllocated(tx *gorm.DB, d *model.ShipmentOrderDe
 		Update("allocated_qty", d.AllocatedQty).Error
 }
 
-// UpdateDetailPicked 累加明细拣货量。
-func (r *Repository) UpdateDetailPicked(tx *gorm.DB, d *model.ShipmentOrderDetail) error {
-	return tx.Model(&model.ShipmentOrderDetail{}).Where("id = ?", d.ID).
-		Update("picked_qty", d.PickedQty).Error
+// IncrDetailPicked 原子累加明细拣货量（picked_qty = picked_qty + delta）。
+func (r *Repository) IncrDetailPicked(tx *gorm.DB, detailID int64, delta int) error {
+	return tx.Model(&model.ShipmentOrderDetail{}).Where("id = ?", detailID).
+		Update("picked_qty", gorm.Expr("picked_qty + ?", delta)).Error
 }
 
-// UpdateOrderProgress 累加主单分配/拣货量并推进状态（乐观锁）。
-func (r *Repository) UpdateOrderProgress(tx *gorm.DB, o *model.ShipmentOrder) error {
-	return tx.Model(&model.ShipmentOrder{}).Where("id = ? AND version = ?", o.ID, o.Version).Updates(map[string]any{
+// UpdateOrderProgress 审核分配后一次性写入主单分配量并推进状态（version 乐观锁）。
+// 返回 RowsAffected：0 表示版本冲突（已被并发事务修改），调用方应返回 VersionBad 或重试。
+func (r *Repository) UpdateOrderProgress(tx *gorm.DB, o *model.ShipmentOrder) (int64, error) {
+	res := tx.Model(&model.ShipmentOrder{}).Where("id = ? AND version = ?", o.ID, o.Version).Updates(map[string]any{
 		"allocated_qty": o.AllocatedQty, "picked_qty": o.PickedQty,
-		"status": o.Status, "version": o.Version + 1,
-	}).Error
+		"status": o.Status, "version": gorm.Expr("version + 1"),
+	})
+	return res.RowsAffected, res.Error
+}
+
+// IncrOrderPicked 原子累加主单拣货量（picked_qty = picked_qty + delta，version +1）。
+// 拣货并发时不再依赖内存读-改-写；返回 RowsAffected，0 表示版本冲突需重试。
+func (r *Repository) IncrOrderPicked(tx *gorm.DB, id int64, version int, delta int) (int64, error) {
+	res := tx.Model(&model.ShipmentOrder{}).Where("id = ? AND version = ?", id, version).
+		Updates(map[string]any{
+			"picked_qty": gorm.Expr("picked_qty + ?", delta),
+			"version":    gorm.Expr("version + 1"),
+		})
+	return res.RowsAffected, res.Error
 }
 
 func (r *Repository) ListOrders(ctx context.Context, db *gorm.DB, warehouseID int64, status, keyword string, page, size int) ([]*model.ShipmentOrder, int64, error) {
@@ -143,11 +156,18 @@ func (r *Repository) GetAllocationForUpdate(tx *gorm.DB, id int64) (*model.Alloc
 	return &a, nil
 }
 
-// UpdateAllocationPicked 更新分配行拣货量与状态。
-func (r *Repository) UpdateAllocationPicked(tx *gorm.DB, a *model.Allocation) error {
-	return tx.Model(&model.Allocation{}).Where("id = ? AND version = ?", a.ID, a.Version).Updates(map[string]any{
-		"picked_qty": a.PickedQty, "status": a.Status, "version": a.Version + 1,
-	}).Error
+// IncrAllocationPicked 原子累加分配行拣货量，拣满时置为 PICKED（version 乐观锁 + status 条件）。
+// delta 为本次拣货数，toStatus 传入拣满后的 AllocPicked 或未拣满时的 AllocAllocated。
+// 返回 RowsAffected：0 表示分配行已被并发改动（状态非 ALLOCATED 或版本冲突），需重试。
+func (r *Repository) IncrAllocationPicked(tx *gorm.DB, a *model.Allocation, delta int, toStatus model.AllocationStatus) (int64, error) {
+	res := tx.Model(&model.Allocation{}).
+		Where("id = ? AND version = ? AND status = ?", a.ID, a.Version, model.AllocAllocated).
+		Updates(map[string]any{
+			"picked_qty": gorm.Expr("picked_qty + ?", delta),
+			"status":     toStatus,
+			"version":    gorm.Expr("version + 1"),
+		})
+	return res.RowsAffected, res.Error
 }
 
 // CancelAllocationsByOrder 取消单据全部已分配未拣货行。

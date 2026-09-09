@@ -124,7 +124,25 @@ func (s *Service) progress(tx *gorm.DB, t *model.Task, qty int, operator string)
 		return errcode.TaskStatusWrong
 	}
 	t.Status = next
-	return s.repo.UpdateProgress(tx, t)
+	if n, err := s.repo.UpdateProgress(tx, t); err != nil {
+		return err
+	} else if n == 0 {
+		// version 冲突：任务已被并发事务推进，提示重试而非"任务不存在"
+		return errcode.Conflict
+	}
+	return nil
+}
+
+// GetForUpdate 事务内行锁读取任务（供业务事务在执行前锁定并校验任务状态）。
+func (s *Service) GetForUpdate(ctx context.Context, tx *gorm.DB, taskID int64) (*model.Task, error) {
+	t, err := s.repo.GetForUpdate(tx, taskID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, errcode.TaskNotFound
+		}
+		return nil, err
+	}
+	return t, nil
 }
 
 func (s *Service) List(ctx context.Context, orderID int64, taskType string, page, size int) ([]*model.Task, int64, error) {
