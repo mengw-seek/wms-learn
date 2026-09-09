@@ -1,8 +1,5 @@
 version: "2"
 
-run:
-  timeout: 5m
-
 linters:
   default: none
   enable:
@@ -15,14 +12,23 @@ linters:
   settings:
     staticcheck:
       checks: ["all"]
+  exclusions:
+    rules:
+      # 测试文件中允许忽略返回值（如构造测试数据）
+      - path: _test\.go
+        linters:
+          - errcheck
+      # 排除 ST1000 包注释缺失：练手项目暂不强求 GoDoc 风格
+      - path: .*
+        linters:
+          - staticcheck
+        text: "ST1000"
+      # 排除 errcheck 的 .Close() 未检查：Go 社区 defer f.Close() 是常见写法
+      - path: .*
+        linters:
+          - errcheck
+        text: "Error return value of .Close. is not checked"
 
 formatters:
   enable:
     - gofmt
-
-issues:
-  exclude-rules:
-    # 测试文件中允许忽略返回值（如构造测试数据）
-    - path: _test\.go
-      linters:
-        - errcheck
